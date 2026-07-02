@@ -15,6 +15,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import CONF_DEVICE_NAME, CONF_DEVICE_UUID, CONF_MAC_ADDRESS, CONF_NUM_ZONES, DEFAULT_NUM_ZONES, DEFAULT_SHORT_NAME, DOMAIN
 from .coordinator import AiraDataUpdateCoordinator, _parse_error
+from .error_codes import ERROR_CODES
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -288,10 +289,23 @@ class AiraProblemBinarySensor(AiraBaseBinarySensor):
         matching = self._get_matching_errors()
         attributes[f"{self._prefix_label}_count"] = len(matching)
 
+        # The BLE Error protobuf exposes only a severity, an occurred_at
+        # timestamp and a oneof of ccv/aira/power enum codes -- raw_code is
+        # that enum value's name, which is also the key into ERROR_CODES for
+        # its human-readable description/suggested_action.
         for i, (source, display_code, raw_code, severity, occurred_at) in enumerate(matching[:5], 1):
+            code_info = ERROR_CODES.get(raw_code, {})
+            description = code_info.get("description") or display_code
             attributes[f"{self._prefix_label}_{i}_source"] = source
             attributes[f"{self._prefix_label}_{i}_code"] = display_code
             attributes[f"{self._prefix_label}_{i}_severity"] = severity
+            attributes[f"{self._prefix_label}_{i}_description"] = description
+            # Deprecated: error_N_message is kept as an alias of
+            # error_N_description for backward compatibility and will be removed
+            # in a future release. Prefer error_N_description.
+            attributes[f"{self._prefix_label}_{i}_message"] = description
+            if code_info.get("suggested_action"):
+                attributes[f"{self._prefix_label}_{i}_suggested_action"] = code_info["suggested_action"]
             if occurred_at:
                 attributes[f"{self._prefix_label}_{i}_occurred_at"] = (
                     occurred_at.isoformat() if hasattr(occurred_at, "isoformat") else str(occurred_at)
