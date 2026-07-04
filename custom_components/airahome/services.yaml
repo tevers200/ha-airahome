@@ -13,6 +13,29 @@ set_away_mode:
       selector:
         date:
 
+dump_config:
+  target:
+    device:
+      - integration: airahome
+    entity:
+      - integration: airahome
+
+enable_cooling:
+  target:
+    device:
+      - integration: airahome
+    entity:
+      - domain: climate
+        integration: airahome
+
+disable_cooling:
+  target:
+    device:
+      - integration: airahome
+    entity:
+      - domain: climate
+        integration: airahome
+
 deactivate_dhw_boost:
   target:
     entity:
