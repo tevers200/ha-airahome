@@ -213,6 +213,8 @@
       "zone_2_dew_point": { "name": "Zone 2 Dew Point" },
       "zone_1_cooling_supply_floor": { "name": "Zone 1 Cooling Supply Floor" },
       "zone_2_cooling_supply_floor": { "name": "Zone 2 Cooling Supply Floor" },
+      "zone_1_thermostat_last_update": { "name": "Zone 1 Thermostat Last Update" },
+      "zone_2_thermostat_last_update": { "name": "Zone 2 Thermostat Last Update" },
       "zone_2_heat_target": { "name": "Zone 2 Heating Target" },
       "zone_2_cool_target": { "name": "Zone 2 Cooling Target" },
       "zone_2_heating_curve": { "name": "Zone 2 Heating Curve" },

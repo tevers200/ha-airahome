@@ -1,7 +1,7 @@
 """Sensor platform for Aira Heat Pump."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 from typing import Any
 
@@ -404,6 +404,14 @@ async def async_setup_entry(
         # Cooling condensation safety net (read-only observation).
         AiraDewPointSensor(coordinator, entry, zone=i),
         AiraCoolingSupplyFloorSensor(coordinator, entry, zone=i),
+        # When the zone thermostat last reported (gauge the real refresh rate).
+        AiraTimestampSensor(coordinator, entry,
+            unique_id_suffix=f"zone_{i}_thermostat_last_update",
+            data_path=("state", "thermostats", "last_update_timestamp"),
+            icon="mdi:clock-check-outline",
+            index=f"ZONE_{i}",
+            entity_category=EntityCategory.DIAGNOSTIC,
+        ),
         ])
 
         # check configured modes on the heatpump to enable heating/cooling targets accordingly
@@ -719,6 +727,64 @@ class AiraCoolingSupplyFloorSensor(AiraSensorBase):
             "supply_min": DEFAULT_COOLING_SUPPLY_MIN_C,
             "supply_max": DEFAULT_COOLING_SUPPLY_MAX_C,
         }
+
+
+# ============================================================================
+# TIMESTAMP SENSORS
+# ============================================================================
+
+class AiraTimestampSensor(AiraSensorBase):
+    """Sensor for a protobuf Timestamp field (surfaced as a datetime).
+
+    pyairahome converts Timestamp fields to naive UTC datetimes; Home Assistant
+    requires timezone-aware values for TIMESTAMP sensors, so a UTC tzinfo is
+    attached. An unset timestamp deserialises to the 1970 epoch and is reported
+    as unknown rather than a misleading date.
+    """
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(
+        self,
+        coordinator: AiraDataUpdateCoordinator,
+        entry: ConfigEntry,
+        unique_id_suffix: str,
+        data_path: tuple[str, ...],
+        icon: str | None = None,
+        entity_category: EntityCategory | None = None,
+        enabled_by_default: bool = True,
+        index: int | str | None = None,
+    ) -> None:
+        super().__init__(coordinator, entry, unique_id_suffix, icon, entity_category, enabled_by_default)
+        self._data_path = data_path
+        self._index = index
+
+    @property
+    def native_value(self) -> datetime | None:  # type: ignore
+        if not self.coordinator.data:
+            return None
+        value: Any = self.coordinator.data
+        try:
+            for path in self._data_path:
+                value = value[path]
+                if self._index is not None and isinstance(value, list):
+                    for element in value:
+                        if isinstance(self._index, str) and element.get("zone") == self._index:
+                            value = element
+                            break
+                    if isinstance(self._index, int) and len(value) >= self._index:
+                        value = value[self._index - 1]
+        except (KeyError, ValueError, TypeError):
+            return None
+        if isinstance(value, str):
+            value = dt_util.parse_datetime(value)
+        if not isinstance(value, datetime):
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        if value.year < 2000:  # unset Timestamp -> 1970 epoch
+            return None
+        return value
 
 
 # ============================================================================
