@@ -36,6 +36,24 @@ disable_cooling:
       - domain: climate
         integration: airahome
 
+set_cooling_mode:
+  target:
+    device:
+      - integration: airahome
+    entity:
+      - integration: airahome
+  fields:
+    enabled:
+      required: false
+      default: true
+      selector:
+        boolean:
+    dry_run:
+      required: false
+      default: true
+      selector:
+        boolean:
+
 deactivate_dhw_boost:
   target:
     entity:

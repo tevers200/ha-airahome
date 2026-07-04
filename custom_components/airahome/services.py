@@ -8,17 +8,20 @@ import logging
 from typing import Any
 
 from google.protobuf.duration_pb2 import Duration
+from google.protobuf.json_format import MessageToDict
 from google.protobuf.timestamp_pb2 import Timestamp
 from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv, device_registry as dr, entity_registry as er
 from pyairahome.commands import (
     ActivateHotWaterBoosting,
+    ConfigureHeatPump,
     DeactivateHotWaterBoosting,
     DisableCoolingFunction,
     EnableCoolingFunction,
     SetAwayMode,
 )
+from pyairahome.device.heat_pump.config.v1.config_pb2 import Config
 import voluptuous as vol
 
 from .const import DOMAIN
@@ -32,6 +35,7 @@ SERVICE_SET_AWAY_MODE = "set_away_mode"
 SERVICE_DUMP_CONFIG = "dump_config"
 SERVICE_ENABLE_COOLING = "enable_cooling"
 SERVICE_DISABLE_COOLING = "disable_cooling"
+SERVICE_SET_COOLING_MODE = "set_cooling_mode"
 
 DHW_BOOST_VALID_HOURS = [1, 2, 3, 4, 6, 8, 12, 24]
 AWAY_MODE_MIN_DAYS = 3
@@ -60,6 +64,11 @@ SET_AWAY_MODE_SCHEMA = vol.Schema({
 DUMP_CONFIG_SCHEMA = vol.Schema(_TARGET_SCHEMA)
 ENABLE_COOLING_SCHEMA = vol.Schema(_TARGET_SCHEMA)
 DISABLE_COOLING_SCHEMA = vol.Schema(_TARGET_SCHEMA)
+SET_COOLING_MODE_SCHEMA = vol.Schema({
+    **_TARGET_SCHEMA,
+    vol.Optional("enabled", default=True): cv.boolean,
+    vol.Optional("dry_run", default=True): cv.boolean,
+})
 
 SERVICES = [
     SERVICE_ACTIVATE_DHW_BOOST,
@@ -68,6 +77,7 @@ SERVICES = [
     SERVICE_DUMP_CONFIG,
     SERVICE_ENABLE_COOLING,
     SERVICE_DISABLE_COOLING,
+    SERVICE_SET_COOLING_MODE,
 ]
 
 # Keys worth calling out for the cooling-capability question.
@@ -102,6 +112,27 @@ def _cooling_summary(config_inner: dict, state_inner: dict) -> dict[str, Any]:
         "outdoor_unit_size": config_inner.get("outdoor_unit_size"),
         "cooling_related_config": cooling_fields or "none found",
     }
+
+
+def _config_diff(old: dict, new: dict) -> dict[str, Any]:
+    """Return changed scalar leaves as dotted-path -> {from, to}."""
+    lo, ln = _leaves(old), _leaves(new)
+    return {
+        k: {"from": lo.get(k), "to": ln.get(k)}
+        for k in sorted(set(lo) | set(ln))
+        if lo.get(k) != ln.get(k)
+    }
+
+
+async def _run_command_checked(aira: Any, command_in: Any, description: str) -> None:
+    """Run a BLE command and raise HomeAssistantError if it did not succeed."""
+    try:
+        updates = [x async for x in await aira.ble._run_command(command_in=command_in)]  # type: ignore
+    except RuntimeError as e:
+        raise HomeAssistantError(f"Error during {description}: {e}") from e
+    if not updates or "error" in updates[-1]:
+        detail = updates[-1].get("error") if updates else "no response"
+        raise HomeAssistantError(f"{description} failed: {detail}")
 
 
 def _get_aira_instances_from_target(hass: HomeAssistant, call: ServiceCall) -> list:
@@ -305,6 +336,82 @@ async def _toggle_cooling_function(hass: HomeAssistant, call: ServiceCall, enabl
             raise HomeAssistantError(f"Error trying to {action} cooling function: {e}") from e
 
 
+async def _handle_set_cooling_mode(hass: HomeAssistant, call: ServiceCall) -> ServiceResponse:
+    """Enable or disable cooling mode on the heat pump.
+
+    Sets the per-zone ``cooling.enabled`` CCV flag (via ConfigureHeatPump) and
+    toggles the cooling capability (Enable/DisableCoolingFunction). ``dry_run``
+    defaults to True and only *previews* the exact config change; pass
+    ``dry_run: false`` to actually write. When enabling, this is the first write
+    this integration makes to the pump.
+    """
+    enabled: bool = call.data.get("enabled", True)
+    dry_run: bool = call.data.get("dry_run", True)
+
+    airas = _get_aira_instances_from_target(hass, call)
+    if not airas:
+        raise ServiceValidationError("No configured Aira device matched the target")
+
+    def _to_dict(msg: Any) -> dict:
+        return MessageToDict(msg, preserving_proto_field_name=True, always_print_fields_with_no_presence=True)
+
+    devices: list[dict[str, Any]] = []
+    for aira in airas:
+        try:
+            response = await aira.ble._get_configuration(raw=True)  # type: ignore
+        except Exception as err:  # noqa: BLE001 - report instead of aborting the whole call
+            _LOGGER.exception("set_cooling_mode: failed to read configuration")
+            devices.append({"error": f"could not read configuration: {err!r}"})
+            continue
+
+        # _get_configuration returns a DataResponse whose `config` field is the
+        # inner CcvConfig. Guard against writing back a config that didn't read
+        # back populated -- a blind write of an empty config could blank the pump.
+        ccv = response.config  # CcvConfig
+        if not response.HasField("config") or not ccv.heating_cooling.num_zones or ccv.outdoor_unit_size == 0:
+            devices.append({"error": "device did not return a valid configuration; refusing to write"})
+            continue
+
+        proposed = ccv.__class__()  # CcvConfig
+        proposed.CopyFrom(ccv)
+        num_zones = proposed.heating_cooling.num_zones or 1
+        zones_changed: list[int] = []
+        for z in range(1, num_zones + 1):
+            zone = getattr(proposed.heating_cooling, f"settings_zone_{z}", None)
+            if zone is not None and zone.cooling.enabled != enabled:
+                zone.cooling.enabled = enabled
+                zones_changed.append(z)
+
+        result: dict[str, Any] = {
+            "zones": list(range(1, num_zones + 1)),
+            "zones_changed": zones_changed,
+            "capability_command": "EnableCoolingFunction" if enabled else "DisableCoolingFunction",
+            "config_changes": _config_diff(_to_dict(ccv), _to_dict(proposed)),
+            "dry_run": dry_run,
+            "applied": False,
+        }
+
+        if not dry_run:
+            # 1. Capability toggle (idempotent).
+            await _run_command_checked(
+                aira,
+                EnableCoolingFunction() if enabled else DisableCoolingFunction(),
+                "cooling capability toggle",
+            )
+            # 2. Config write, only if a zone's flag actually changed. ConfigureHeatPump
+            #    wraps the inner CcvConfig in a Config message.
+            if zones_changed:
+                await _run_command_checked(
+                    aira, ConfigureHeatPump(config=Config(ccv=proposed)), "cooling config write",
+                )
+            result["applied"] = True
+            _LOGGER.info("set_cooling_mode applied: enabled=%s zones_changed=%s", enabled, zones_changed)
+
+        devices.append(result)
+
+    return json.loads(json.dumps({"enabled": enabled, "dry_run": dry_run, "devices": devices}, default=str))
+
+
 async def async_setup_services(hass: HomeAssistant) -> None:
     """Register airahome services."""
     hass.services.async_register(
@@ -343,6 +450,13 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         SERVICE_DISABLE_COOLING,
         partial(_toggle_cooling_function, hass, enable=False),
         schema=DISABLE_COOLING_SCHEMA,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_COOLING_MODE,
+        partial(_handle_set_cooling_mode, hass),
+        schema=SET_COOLING_MODE_SCHEMA,
+        supports_response=SupportsResponse.OPTIONAL,
     )
 
 

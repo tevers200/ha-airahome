@@ -262,6 +262,20 @@
         }
       }
     },
+    "set_cooling_mode": {
+      "name": "Set Cooling Mode",
+      "description": "Enables or disables cooling mode on the heat pump (per-zone cooling flag plus the cooling capability). With Dry run on (the default) it only returns a preview of the exact configuration change and writes nothing; turn Dry run off to apply.",
+      "fields": {
+        "enabled": {
+          "name": "Enabled",
+          "description": "Enable cooling (on) or disable it (off)."
+        },
+        "dry_run": {
+          "name": "Dry run",
+          "description": "Preview the change without writing to the device. Turn off to actually apply it."
+        }
+      }
+    },
     "deactivate_dhw_boost": {
       "name": "Deactivate DHW Boost",
       "description": "Deactivates DHW boost mode."
