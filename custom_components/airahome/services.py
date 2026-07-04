@@ -1,6 +1,7 @@
 """Services for the Aira Home integration."""
 from __future__ import annotations
 
+import asyncio
 import datetime
 from functools import partial
 import json
@@ -24,7 +25,7 @@ from pyairahome.commands import (
 from pyairahome.device.heat_pump.config.v1.config_pb2 import Config
 import voluptuous as vol
 
-from .const import DOMAIN
+from .const import BLE_COMMAND_SLEEP, DOMAIN
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -398,14 +399,37 @@ async def _handle_set_cooling_mode(hass: HomeAssistant, call: ServiceCall) -> Se
                 EnableCoolingFunction() if enabled else DisableCoolingFunction(),
                 "cooling capability toggle",
             )
+            result["verified"] = True  # downgraded only if the read-back itself fails
             # 2. Config write, only if a zone's flag actually changed. ConfigureHeatPump
             #    wraps the inner CcvConfig in a Config message.
             if zones_changed:
                 await _run_command_checked(
                     aira, ConfigureHeatPump(config=Config(ccv=proposed)), "cooling config write",
                 )
+                # 3. Post-write reconcile: a command can report no error without the
+                #    change persisting, so re-read the config and confirm the flag took.
+                await asyncio.sleep(BLE_COMMAND_SLEEP)  # let the device commit before reading back
+                try:
+                    verify_ccv = (await aira.ble._get_configuration(raw=True)).config  # type: ignore
+                except Exception as err:  # noqa: BLE001 - couldn't verify, but the write itself succeeded
+                    _LOGGER.warning("set_cooling_mode: could not read back config to verify write: %s", err)
+                    result["verified"] = False
+                else:
+                    mismatched: list[int] = []
+                    for z in zones_changed:
+                        zone = getattr(verify_ccv.heating_cooling, f"settings_zone_{z}", None)
+                        if zone is None or zone.cooling.enabled != enabled:
+                            mismatched.append(z)
+                    if mismatched:
+                        raise HomeAssistantError(
+                            f"Cooling config write did not persist for zone(s) {mismatched}: "
+                            f"cooling.enabled is not {enabled} after write"
+                        )
             result["applied"] = True
-            _LOGGER.info("set_cooling_mode applied: enabled=%s zones_changed=%s", enabled, zones_changed)
+            _LOGGER.info(
+                "set_cooling_mode applied: enabled=%s zones_changed=%s verified=%s",
+                enabled, zones_changed, result["verified"],
+            )
 
         devices.append(result)
 
