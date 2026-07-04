@@ -21,8 +21,10 @@ from pyairahome.commands import (
     DeactivateHotWaterBoosting,
     DisableCoolingFunction,
     EnableCoolingFunction,
+    ModbusRequest,
     SetAwayMode,
 )
+from pyairahome.device.heat_pump.command.v1.modbus_pb2 import ModbusRegisterData
 from pyairahome.device.heat_pump.config.v1.config_pb2 import Config
 import voluptuous as vol
 
@@ -38,6 +40,13 @@ SERVICE_DUMP_CONFIG = "dump_config"
 SERVICE_ENABLE_COOLING = "enable_cooling"
 SERVICE_DISABLE_COOLING = "disable_cooling"
 SERVICE_SET_COOLING_MODE = "set_cooling_mode"
+SERVICE_MODBUS_READ = "modbus_read"
+
+# Modbus enums (from pyairahome). Only read function codes are ever allowed here.
+MODBUS_READ_FUNCTIONS = {1: "read_coil", 3: "read_holding", 4: "read_input"}
+MODBUS_UNITS = {1: "carel", 100: "cm", 127: "ccv", 130: "outdoor"}
+MODBUS_RETURN_TYPES = {1: "coil", 2: "byte", 3: "signed_byte", 4: "word", 5: "signed_word", 6: "long", 7: "signed_long"}
+MODBUS_MAX_COUNT = 8  # keep a probe within the websocket service-call timeout
 
 DHW_BOOST_VALID_HOURS = [1, 2, 3, 4, 6, 8, 12, 24]
 AWAY_MODE_MIN_DAYS = 3
@@ -77,6 +86,14 @@ SET_COOLING_MODE_SCHEMA = vol.Schema({
     vol.Optional("enabled", default=True): cv.boolean,
     vol.Optional("dry_run", default=True): cv.boolean,
 })
+MODBUS_READ_SCHEMA = vol.Schema({
+    **_TARGET_SCHEMA,
+    vol.Required("address"): vol.All(vol.Coerce(int), vol.Range(min=0, max=65535)),
+    vol.Optional("unit", default=130): vol.All(vol.Coerce(int), vol.In(list(MODBUS_UNITS))),
+    vol.Optional("function", default=3): vol.All(vol.Coerce(int), vol.In(list(MODBUS_READ_FUNCTIONS))),
+    vol.Optional("return_type", default=4): vol.All(vol.Coerce(int), vol.In(list(MODBUS_RETURN_TYPES))),
+    vol.Optional("count", default=1): vol.All(vol.Coerce(int), vol.Range(min=1, max=MODBUS_MAX_COUNT)),
+})
 
 SERVICES = [
     SERVICE_ACTIVATE_DHW_BOOST,
@@ -86,6 +103,7 @@ SERVICES = [
     SERVICE_ENABLE_COOLING,
     SERVICE_DISABLE_COOLING,
     SERVICE_SET_COOLING_MODE,
+    SERVICE_MODBUS_READ,
 ]
 
 # Keys worth calling out for the cooling-capability question.
@@ -496,6 +514,51 @@ async def _handle_set_cooling_mode(hass: HomeAssistant, call: ServiceCall) -> Se
     return json.loads(json.dumps({"enabled": enabled, "dry_run": dry_run, "devices": devices}, default=str))
 
 
+async def _handle_modbus_read(hass: HomeAssistant, call: ServiceCall) -> ServiceResponse:
+    """Read-only Modbus register probe.
+
+    Sends Modbus READ requests (function codes 1/3/4 only) through the pump's
+    BLE gateway to a chosen unit, and returns the raw responses. Write function
+    codes are impossible via this service. Exploratory: it reveals both whether
+    ModbusRequest is gated (a silent timeout means yes) and the response shape.
+    """
+    function: int = call.data.get("function", 3)
+    if function not in MODBUS_READ_FUNCTIONS:
+        # Belt-and-braces on top of the schema: never allow a write code.
+        raise ServiceValidationError("modbus_read only permits read function codes (1, 3, 4)")
+    unit: int = call.data.get("unit", 130)
+    return_type: int = call.data.get("return_type", 4)
+    start: int = call.data["address"]
+    count: int = call.data.get("count", 1)
+
+    airas = _get_aira_instances_from_target(hass, call)
+    if not airas:
+        raise ServiceValidationError("No configured Aira device matched the target")
+    aira = airas[0]  # a probe targets a single device
+
+    registers: dict[int, Any] = {}
+    for addr in range(start, start + count):
+        try:
+            # Empty register data for a read; return_type sets the interpretation/width.
+            updates = [x async for x in await aira.ble._run_command(  # type: ignore
+                command_in=ModbusRequest(
+                    unit=unit, function=function, address=addr,
+                    data=ModbusRegisterData(), return_type=return_type,
+                ))]
+            registers[addr] = updates[-1] if updates else "no response"
+        except Exception as err:  # noqa: BLE001 - report per-register instead of aborting
+            registers[addr] = {"error": repr(err)}
+        await asyncio.sleep(0.4)  # brief gap between reads
+
+    return json.loads(json.dumps({
+        "unit": MODBUS_UNITS.get(unit, unit),
+        "function": MODBUS_READ_FUNCTIONS.get(function, function),
+        "return_type": MODBUS_RETURN_TYPES.get(return_type, return_type),
+        "start_address": start,
+        "registers": registers,
+    }, default=str))
+
+
 async def async_setup_services(hass: HomeAssistant) -> None:
     """Register airahome services."""
     hass.services.async_register(
@@ -541,6 +604,13 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         partial(_handle_set_cooling_mode, hass),
         schema=SET_COOLING_MODE_SCHEMA,
         supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_MODBUS_READ,
+        partial(_handle_modbus_read, hass),
+        schema=MODBUS_READ_SCHEMA,
+        supports_response=SupportsResponse.ONLY,
     )
 
 

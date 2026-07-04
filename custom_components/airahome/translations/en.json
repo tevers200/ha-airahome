@@ -276,6 +276,17 @@
         }
       }
     },
+    "modbus_read": {
+      "name": "Modbus Read (diagnostic)",
+      "description": "Read-only probe of the pump's internal Modbus bus via the BLE gateway. Only read function codes are possible. Returns the raw response for the given register(s).",
+      "fields": {
+        "address": { "name": "Address", "description": "Start register address (0-65535)." },
+        "unit": { "name": "Unit", "description": "Modbus unit: Carel (1), CM (100), CCV (127) or Outdoor (130)." },
+        "function": { "name": "Function", "description": "Read function: read coil (1), read holding (3) or read input (4)." },
+        "return_type": { "name": "Return type", "description": "How to interpret each value (word, long, signed variants, etc.)." },
+        "count": { "name": "Count", "description": "How many consecutive registers to read (1-8)." }
+      }
+    },
     "deactivate_dhw_boost": {
       "name": "Deactivate DHW Boost",
       "description": "Deactivates DHW boost mode."
