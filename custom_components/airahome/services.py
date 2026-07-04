@@ -11,6 +11,7 @@ from typing import Any
 from google.protobuf.duration_pb2 import Duration
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.timestamp_pb2 import Timestamp
+from homeassistant.components import persistent_notification
 from homeassistant.core import HomeAssistant, ServiceCall, ServiceResponse, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers import config_validation as cv, device_registry as dr, entity_registry as er
@@ -40,6 +41,12 @@ SERVICE_SET_COOLING_MODE = "set_cooling_mode"
 
 DHW_BOOST_VALID_HOURS = [1, 2, 3, 4, 6, 8, 12, 24]
 AWAY_MODE_MIN_DAYS = 3
+
+# ConfigureHeatPump is a large write; the device can take well over the default
+# 8s BLE-notify timeout to acknowledge it, so give it longer and retry. Success
+# is confirmed by reading the config back, not by the command's progress ack.
+COOLING_WRITE_NOTIFY_TIMEOUT = 30  # seconds to wait for the write's progress ack
+COOLING_WRITE_ATTEMPTS = 3
 
 _TARGET_SCHEMA = {
     vol.Optional("entity_id"): vol.Any(cv.string, [cv.string]),
@@ -129,7 +136,7 @@ async def _run_command_checked(aira: Any, command_in: Any, description: str) -> 
     """Run a BLE command and raise HomeAssistantError if it did not succeed."""
     try:
         updates = [x async for x in await aira.ble._run_command(command_in=command_in)]  # type: ignore
-    except RuntimeError as e:
+    except (RuntimeError, TimeoutError, OSError) as e:
         raise HomeAssistantError(f"Error during {description}: {e}") from e
     if not updates or "error" in updates[-1]:
         detail = updates[-1].get("error") if updates else "no response"
@@ -337,6 +344,83 @@ async def _toggle_cooling_function(hass: HomeAssistant, call: ServiceCall, enabl
             raise HomeAssistantError(f"Error trying to {action} cooling function: {e}") from e
 
 
+def _cooling_flags_ok(ccv: Any, zones: list[int], expected: bool) -> bool:
+    """True if cooling.enabled == expected for every listed zone in a read-back config."""
+    for z in zones:
+        zone = getattr(ccv.heating_cooling, f"settings_zone_{z}", None)
+        if zone is None or zone.cooling.enabled != expected:
+            return False
+    return True
+
+
+async def _apply_cooling_write(
+    hass: HomeAssistant, aira: Any, proposed: Any, enabled: bool, zones_changed: list[int], label: str,
+) -> None:
+    """Background task: toggle the cooling capability and write cooling.enabled.
+
+    Runs detached from the service call so the websocket timeout cannot cancel it.
+    The large ConfigureHeatPump write often doesn't return a progress ack in time,
+    so a missing ack is tolerated and success is confirmed by reading the config
+    back. Outcome is reported via a persistent notification.
+    """
+    notif_id = f"airahome_cooling_{label}".replace(" ", "_")
+    verb = "enable" if enabled else "disable"
+
+    def _notify(message: str) -> None:
+        persistent_notification.async_create(hass, message, title="Aira cooling mode", notification_id=notif_id)
+
+    try:
+        # Capability toggle first (small command, acks normally). Abort if it fails.
+        await _run_command_checked(
+            aira, EnableCoolingFunction() if enabled else DisableCoolingFunction(), "cooling capability toggle",
+        )
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.error("set_cooling_mode: capability toggle failed for %s: %s", label, err)
+        _notify(f"Failed to {verb} cooling on {label}: capability toggle failed ({err}).")
+        return
+
+    if not zones_changed:
+        _LOGGER.info("set_cooling_mode: nothing to write for %s (already %sd)", label, verb)
+        _notify(f"Cooling already {verb}d on {label}.")
+        return
+
+    original_timeout = aira.ble_notify_timeout
+    aira.ble_notify_timeout = COOLING_WRITE_NOTIFY_TIMEOUT
+    try:
+        for attempt in range(1, COOLING_WRITE_ATTEMPTS + 1):
+            try:
+                updates = [x async for x in await aira.ble._run_command(  # type: ignore
+                    command_in=ConfigureHeatPump(config=Config(ccv=proposed)))]
+                if updates and "error" in updates[-1]:
+                    _LOGGER.warning("set_cooling_mode: write attempt %d rejected for %s: %s",
+                                    attempt, label, updates[-1]["error"])
+            except Exception as err:  # noqa: BLE001 - missing ack; verify via read-back below
+                _LOGGER.warning("set_cooling_mode: write attempt %d ack incomplete for %s: %s",
+                                attempt, label, err)
+
+            await asyncio.sleep(BLE_COMMAND_SLEEP)  # let the device commit before reading back
+            try:
+                verify_ccv = (await aira.ble._get_configuration(raw=True)).config  # type: ignore
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("set_cooling_mode: verify read failed on attempt %d for %s: %s",
+                                attempt, label, err)
+                continue
+
+            if _cooling_flags_ok(verify_ccv, zones_changed, enabled):
+                _LOGGER.info("set_cooling_mode: %sd cooling on %s (attempt %d)", verb, label, attempt)
+                _notify(f"Cooling {verb}d on {label}. Reload the integration to pick up the Cool mode.")
+                return
+
+        _LOGGER.error("set_cooling_mode: config write did not persist for %s after %d attempts",
+                      label, COOLING_WRITE_ATTEMPTS)
+        _notify(
+            f"Could not {verb} cooling on {label}: the config write did not persist after "
+            f"{COOLING_WRITE_ATTEMPTS} attempts. The device may be rejecting it — nothing else was changed."
+        )
+    finally:
+        aira.ble_notify_timeout = original_timeout
+
+
 async def _handle_set_cooling_mode(hass: HomeAssistant, call: ServiceCall) -> ServiceResponse:
     """Enable or disable cooling mode on the heat pump.
 
@@ -357,7 +441,8 @@ async def _handle_set_cooling_mode(hass: HomeAssistant, call: ServiceCall) -> Se
         return MessageToDict(msg, preserving_proto_field_name=True, always_print_fields_with_no_presence=True)
 
     devices: list[dict[str, Any]] = []
-    for aira in airas:
+    for idx, aira in enumerate(airas, start=1):
+        label = f"device {idx}" if len(airas) > 1 else "heat pump"
         try:
             response = await aira.ble._get_configuration(raw=True)  # type: ignore
         except Exception as err:  # noqa: BLE001 - report instead of aborting the whole call
@@ -389,46 +474,21 @@ async def _handle_set_cooling_mode(hass: HomeAssistant, call: ServiceCall) -> Se
             "capability_command": "EnableCoolingFunction" if enabled else "DisableCoolingFunction",
             "config_changes": _config_diff(_to_dict(ccv), _to_dict(proposed)),
             "dry_run": dry_run,
-            "applied": False,
         }
 
-        if not dry_run:
-            # 1. Capability toggle (idempotent).
-            await _run_command_checked(
-                aira,
-                EnableCoolingFunction() if enabled else DisableCoolingFunction(),
-                "cooling capability toggle",
+        if dry_run:
+            result["status"] = "preview only, nothing written"
+        else:
+            # The BLE config write is slow and must outlive the websocket timeout,
+            # so run it detached as a background task. It reports its outcome via a
+            # persistent notification and confirms success by reading the config back.
+            hass.async_create_task(
+                _apply_cooling_write(hass, aira, proposed, enabled, zones_changed, label),
+                name=f"airahome set_cooling_mode {label}",
             )
-            result["verified"] = True  # downgraded only if the read-back itself fails
-            # 2. Config write, only if a zone's flag actually changed. ConfigureHeatPump
-            #    wraps the inner CcvConfig in a Config message.
-            if zones_changed:
-                await _run_command_checked(
-                    aira, ConfigureHeatPump(config=Config(ccv=proposed)), "cooling config write",
-                )
-                # 3. Post-write reconcile: a command can report no error without the
-                #    change persisting, so re-read the config and confirm the flag took.
-                await asyncio.sleep(BLE_COMMAND_SLEEP)  # let the device commit before reading back
-                try:
-                    verify_ccv = (await aira.ble._get_configuration(raw=True)).config  # type: ignore
-                except Exception as err:  # noqa: BLE001 - couldn't verify, but the write itself succeeded
-                    _LOGGER.warning("set_cooling_mode: could not read back config to verify write: %s", err)
-                    result["verified"] = False
-                else:
-                    mismatched: list[int] = []
-                    for z in zones_changed:
-                        zone = getattr(verify_ccv.heating_cooling, f"settings_zone_{z}", None)
-                        if zone is None or zone.cooling.enabled != enabled:
-                            mismatched.append(z)
-                    if mismatched:
-                        raise HomeAssistantError(
-                            f"Cooling config write did not persist for zone(s) {mismatched}: "
-                            f"cooling.enabled is not {enabled} after write"
-                        )
-            result["applied"] = True
-            _LOGGER.info(
-                "set_cooling_mode applied: enabled=%s zones_changed=%s verified=%s",
-                enabled, zones_changed, result["verified"],
+            result["status"] = (
+                "applying in background; watch for the 'Aira cooling mode' notification, "
+                "then re-run with dry_run to confirm"
             )
 
         devices.append(result)
