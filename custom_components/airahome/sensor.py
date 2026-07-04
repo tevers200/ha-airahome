@@ -39,12 +39,16 @@ from .const import (
     CONF_MAC_ADDRESS,
     CONF_NUM_PHASES,
     CONF_NUM_ZONES,
+    DEFAULT_COOLING_SUPPLY_MAX_C,
+    DEFAULT_COOLING_SUPPLY_MIN_C,
+    DEFAULT_DEW_POINT_MARGIN_C,
     DEFAULT_NUM_PHASES,
     DEFAULT_NUM_ZONES,
     DEFAULT_SHORT_NAME,
     DOMAIN,
 )
 from .coordinator import AiraDataUpdateCoordinator
+from .dew_point import cooling_supply_floor, dew_point
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -396,7 +400,10 @@ async def async_setup_entry(
             data_path=("system_check_state", "calculated_setpoints", f"supply_zone_{i}"),
             icon="mdi:thermometer-water",
             entity_category=EntityCategory.DIAGNOSTIC
-        )
+        ),
+        # Cooling condensation safety net (read-only observation).
+        AiraDewPointSensor(coordinator, entry, zone=i),
+        AiraCoolingSupplyFloorSensor(coordinator, entry, zone=i),
         ])
 
         # check configured modes on the heatpump to enable heating/cooling targets accordingly
@@ -616,6 +623,103 @@ class AiraHumiditySensor(AiraSensorBase):
             except (KeyError, ValueError, TypeError):
                 return None
         return None
+
+# ============================================================================
+# DEW POINT / COOLING SAFETY NET SENSORS
+# ============================================================================
+
+def _zone_room_climate(data: dict | None, zone: int) -> tuple[float | None, float | None]:
+    """Return (room_temp_c, humidity_pct) for a zone's thermostat, or (None, None).
+
+    Both values are stored on the device as tenths, so they are divided by 10.
+    """
+    if not data:
+        return None, None
+    try:
+        thermostats = data["state"]["thermostats"]
+    except (KeyError, TypeError):
+        return None, None
+    if not isinstance(thermostats, list):
+        return None, None
+    entry = next((e for e in thermostats if isinstance(e, dict) and e.get("zone") == f"ZONE_{zone}"), None)
+    last_update = entry.get("last_update") if entry else None
+    if not isinstance(last_update, dict):
+        return None, None
+    try:
+        temp = last_update.get("actual_temperature")
+        hum = last_update.get("humidity")
+        temp = float(temp) / 10 if temp is not None else None
+        hum = float(hum) / 10 if hum is not None else None
+    except (ValueError, TypeError):
+        return None, None
+    return temp, hum
+
+
+class AiraDewPointSensor(AiraSensorBase):
+    """Computed dew point for a zone from its thermostat air temp + humidity."""
+
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _attr_suggested_display_precision = 1
+
+    def __init__(self, coordinator: AiraDataUpdateCoordinator, entry: ConfigEntry, zone: int) -> None:
+        super().__init__(coordinator, entry, f"zone_{zone}_dew_point", "mdi:water-thermometer")
+        self._zone = zone
+
+    @property
+    def native_value(self) -> float | None:  # type: ignore
+        temp, hum = _zone_room_climate(self.coordinator.data, self._zone)
+        dp = dew_point(temp, hum)
+        return round(dp, 1) if dp is not None else None
+
+
+class AiraCoolingSupplyFloorSensor(AiraSensorBase):
+    """Recommended cooling supply floor (dew point + margin) as a condensation safety net.
+
+    Read-only for now: shows the minimum_supply_setpoint that Phase 3 would apply,
+    and whether cooling should run at all under the current humidity.
+    """
+
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = UnitOfTemperature.CELSIUS
+    _attr_suggested_display_precision = 1
+
+    def __init__(self, coordinator: AiraDataUpdateCoordinator, entry: ConfigEntry, zone: int) -> None:
+        super().__init__(
+            coordinator, entry, f"zone_{zone}_cooling_supply_floor",
+            "mdi:thermometer-chevron-up", entity_category=EntityCategory.DIAGNOSTIC,
+        )
+        self._zone = zone
+
+    def _floor(self) -> tuple[float | None, float | None, bool]:
+        """Return (dew_point, clamped_floor, cooling_advised)."""
+        temp, hum = _zone_room_climate(self.coordinator.data, self._zone)
+        dp = dew_point(temp, hum)
+        floor, advised = cooling_supply_floor(
+            dp, DEFAULT_DEW_POINT_MARGIN_C,
+            DEFAULT_COOLING_SUPPLY_MIN_C, DEFAULT_COOLING_SUPPLY_MAX_C,
+        )
+        return dp, floor, advised
+
+    @property
+    def native_value(self) -> float | None:  # type: ignore
+        _, floor, _ = self._floor()
+        return round(floor, 1) if floor is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:  # type: ignore
+        dp, _, advised = self._floor()
+        return {
+            "dew_point": round(dp, 1) if dp is not None else None,
+            "margin": DEFAULT_DEW_POINT_MARGIN_C,
+            "unclamped_target": round(dp + DEFAULT_DEW_POINT_MARGIN_C, 1) if dp is not None else None,
+            "cooling_advised": advised,
+            "supply_min": DEFAULT_COOLING_SUPPLY_MIN_C,
+            "supply_max": DEFAULT_COOLING_SUPPLY_MAX_C,
+        }
+
 
 # ============================================================================
 # SIGNAL STRENGTH SENSORS

@@ -34,6 +34,13 @@ ATTR_FIRMWARE_VERSION = "firmware_version"
 ATTR_MODEL = "model"
 ATTR_CONNECTION_TYPE = "connection_type"
 
+# Cooling dew-point safety net (Phase 1: read-only observation)
+DEFAULT_DEW_POINT_MARGIN_C = 2.0  # hold cooling supply this far above the dew point
+# Zone cooling supply limits taken from the commissioned CCV config. Phase 3 will
+# read these live from the device configuration instead of assuming defaults.
+DEFAULT_COOLING_SUPPLY_MIN_C = 10.0
+DEFAULT_COOLING_SUPPLY_MAX_C = 20.0
+
 # Supported device types
 SUPPORTED_DEVICE_TYPES = ["heat_pump"]
 
