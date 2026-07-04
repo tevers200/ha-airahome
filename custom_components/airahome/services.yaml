@@ -54,6 +54,61 @@ set_cooling_mode:
       selector:
         boolean:
 
+modbus_read:
+  target:
+    device:
+      - integration: airahome
+    entity:
+      - integration: airahome
+  fields:
+    address:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 65535
+          mode: box
+    unit:
+      required: false
+      default: 130
+      selector:
+        select:
+          options:
+            - { value: "1", label: "Carel (1)" }
+            - { value: "100", label: "CM (100)" }
+            - { value: "127", label: "CCV (127)" }
+            - { value: "130", label: "Outdoor (130)" }
+    function:
+      required: false
+      default: 3
+      selector:
+        select:
+          options:
+            - { value: "1", label: "Read coil (1)" }
+            - { value: "3", label: "Read holding (3)" }
+            - { value: "4", label: "Read input (4)" }
+    return_type:
+      required: false
+      default: 4
+      selector:
+        select:
+          options:
+            - { value: "1", label: "Coil" }
+            - { value: "2", label: "Byte" }
+            - { value: "3", label: "Signed byte" }
+            - { value: "4", label: "Word" }
+            - { value: "5", label: "Signed word" }
+            - { value: "6", label: "Long" }
+            - { value: "7", label: "Signed long" }
+    count:
+      required: false
+      default: 1
+      selector:
+        number:
+          min: 1
+          max: 8
+          mode: box
+
 deactivate_dhw_boost:
   target:
     entity:
